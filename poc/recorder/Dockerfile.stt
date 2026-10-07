@@ -1,0 +1,3 @@
+FROM ai-brief-recorder:poc
+RUN /opt/venv/bin/pip install --no-cache-dir faster-whisper==1.1.1
+ENV HF_HOME=/models

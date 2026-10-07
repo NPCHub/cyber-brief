@@ -1,0 +1,21 @@
+# Секреты и настройки конкретной установки
+.env
+.env.bak*
+
+# Рабочие данные: записи, голоса, сессия браузера
+jobs/
+voices/
+profile/
+chats.json
+*.wav
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Служебное
+sample_ru.mp3
+tts_body.json
+_player.html

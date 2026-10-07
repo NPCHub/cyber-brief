@@ -1,0 +1,29 @@
+# Шаблон юнита. Сам по себе не работает: install.sh подставляет значения
+# вместо @...@ и кладёт результат в /etc/systemd/system/ai-brief-bot.service.
+[Unit]
+Description=AI-Brief Telegram bot
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=@AI_BRIEF_HOME@
+# Куда класть записи и читать .env. Задаём явно: без этого бот берёт
+# каталог, в котором лежит сам, и при переносе репозитория данные "уедут".
+Environment=AI_BRIEF_HOME=@AI_BRIEF_HOME@
+# Хост часто живёт в UTC, а встречи у людей по местному времени. Пояс задаём
+# сервису, а не системе: часовой пояс хоста разделяют логи соседних сайтов
+# на этом же сервере. Значение берётся из TZ в .env при установке.
+Environment=TZ=@TZ@
+ExecStart=@PYTHON@ @AI_BRIEF_HOME@/service/bot.py
+Restart=always
+RestartSec=5
+# Сам бот только опрашивает Telegram и дёргает docker — тяжёлое живёт
+# в одноразовых контейнерах, у которых свои лимиты.
+MemoryMax=200M
+StandardOutput=append:/var/log/ai-brief-bot.log
+StandardError=append:/var/log/ai-brief-bot.log
+
+[Install]
+WantedBy=multi-user.target
