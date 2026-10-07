@@ -14,7 +14,9 @@ Long polling, а не вебхук — не нужен ни домен, ни TLS
 Настройки лежат в файле .env в каталоге установки (AI_BRIEF_HOME),
 полный список с пояснениями — в .env.example:
     TELEGRAM_BOT_TOKEN   токен бота
-    OPENAI_API_KEY       ключ для расшифровки и саммари
+    OPENAI_API_KEY       ключ OpenAI: расшифровка без gpu-hub и резерв
+    LLM_BASE_URL         OpenAI-совместимый сервер для брифа (пусто — OpenAI)
+    LLM_API_KEY          его ключ (пусто — OPENAI_API_KEY)
     ALLOWED_CHATS        chat_id через запятую; пусто — бот никого не обслуживает
     OWNER_IDS            кто может привязывать чаты командой /link;
                          пусто — владельцами считаются личные чаты из ALLOWED_CHATS
@@ -493,6 +495,44 @@ def ago_ru(sec: float) -> str:
 # как модуль загружен. Константа взяла бы пустую строку и осталась пустой
 # навсегда — /status честно писал «gpu-hub не настроен» при заполненном
 # файле настроек.
+OPENAI_URL = "https://api.openai.com/v1"
+
+
+def llm_url() -> str:
+    """Куда идёт запрос брифа: любой OpenAI-совместимый сервер."""
+    return (os.environ.get("LLM_BASE_URL") or OPENAI_URL).rstrip("/")
+
+
+def llm_key() -> str:
+    if os.environ.get("LLM_API_KEY"):
+        return os.environ["LLM_API_KEY"]
+    return os.environ.get("OPENAI_API_KEY", "") if llm_url() == OPENAI_URL else ""
+
+
+def llm_probe() -> tuple[int, str]:
+    """Пробный запрос в один токен к модели брифа. Список моделей отдаётся
+    и при нулевом балансе, поэтому проверяем настоящим вызовом."""
+    model = os.environ.get("LLM_MODEL") or "gpt-5-mini"
+    body = {"model": model, "max_tokens": 1,
+            "messages": [{"role": "user", "content": "1"}]}
+    if llm_url() == OPENAI_URL:
+        # У OpenAI новые модели не принимают max_tokens, а пробу дешевле
+        # делать самой младшей моделью.
+        body = {"model": "gpt-5-nano", "max_completion_tokens": 1,
+                "messages": body["messages"]}
+    req = urllib.request.Request(
+        f"{llm_url()}/chat/completions", data=json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {llm_key()}",
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status, r.read(2000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(2000).decode("utf-8", "replace")
+    except (OSError, ValueError) as e:
+        return 0, str(e)
+
+
 def hub_url() -> str:
     return os.environ.get("GPUHUB_URL", "").rstrip("/")
 
@@ -563,12 +603,12 @@ def pack_voices(dst: pathlib.Path) -> pathlib.Path | None:
 
 
 def wait_for_local(job_dir: pathlib.Path, chat: int, token: str | None) -> bool:
-    """Отдаём запись в gpu-hub и ждём расшифровку на машина с видеокартой.
+    """Отдаём запись в gpu-hub и ждём расшифровку на машине с видеокартой.
 
-    Локальный путь быстрее и бесплатен, но машину могут выключить —
-    поэтому это ускорение, а не единственная дорога. Не дождались —
-    считаем через OpenAI: встреча не должна пропадать из-за чужого
-    компьютера.
+    Это основной путь: точнее на русском, узнаёт голоса, бесплатен. Но
+    машину могут выключить, поэтому, если есть ключ OpenAI, через
+    LOCAL_WAIT_MIN считаем через него. Без ключа резерва нет — ждём машину
+    сколько потребуется: встреча не должна пропадать.
     """
     if os.environ.get("STT_BACKEND", "openai") != "local-first":
         return False
@@ -593,10 +633,12 @@ def wait_for_local(job_dir: pathlib.Path, chat: int, token: str | None) -> bool:
         log(f"{job_dir.name}: gpu-hub не принял задачу: {type(e).__name__}: {e}")
         return False
 
-    log(f"{job_dir.name}: отдал в gpu-hub ({job['id']}), жду до {local_wait_min()} мин")
+    reserve = bool(os.environ.get("OPENAI_API_KEY"))
+    log(f"{job_dir.name}: отдал в gpu-hub ({job['id']}), жду "
+        + (f"до {local_wait_min()} мин" if reserve else "без срока: резерва нет"))
     (job_dir / "gpuhub.json").write_text(json.dumps(job), encoding="utf-8")
 
-    deadline = time.time() + local_wait_min() * 60
+    deadline = time.time() + (local_wait_min() * 60 if reserve else float("inf"))
     while time.time() < deadline:
         time.sleep(15)
         try:
@@ -974,11 +1016,16 @@ def preflight() -> str | None:
         return (f"Нет образа записи <code>{RECORDER_IMAGE}</code>. Соберите: "
                 f"<code>docker build -t {RECORDER_IMAGE} "
                 f"{html.escape(str(ROOT))}/poc/recorder</code>")
-    if not os.environ.get("OPENAI_API_KEY"):
-        return ("Не задан <code>OPENAI_API_KEY</code> в "
-                f"<code>{html.escape(str(ROOT / '.env'))}</code>: встречу я бы "
-                "записал, а бриф сделать не смогу. Впишите ключ и перезапустите "
-                "службу: <code>systemctl restart ai-brief-bot</code>.")
+    env = html.escape(str(ROOT / ".env"))
+    if not llm_key():
+        return ("Не задан ключ модели для брифа (<code>LLM_API_KEY</code> "
+                f"или <code>OPENAI_API_KEY</code>) в <code>{env}</code>: встречу "
+                "я бы записал, а бриф сделать не смогу. Впишите ключ и "
+                "перезапустите службу: <code>systemctl restart ai-brief-bot</code>.")
+    if not os.environ.get("OPENAI_API_KEY") and not (hub_url() and hub_key()):
+        return ("Нечем расшифровывать: нет ни gpu-hub (<code>GPUHUB_URL</code>, "
+                "<code>GPUHUB_KEY</code>), ни <code>OPENAI_API_KEY</code> в "
+                f"<code>{env}</code>.")
     return None
 
 
@@ -1732,11 +1779,15 @@ class Bot:
             lines.append("⚠️ Диск заканчивается — освободите место через /delete")
 
         # Проверяем именно то, без чего бриф не соберётся.
-        code = sh("curl -s -o /dev/null -w '%{http_code}' -m 10 "
-                  "-H \"Authorization: Bearer $OPENAI_API_KEY\" "
-                  "https://api.openai.com/v1/models")
-        lines.append(f"\n<b>Внешние сервисы</b>\nOpenAI: "
-                     + ("ключ принят" if code == "200" else f"ПРОБЛЕМА (код {code})"))
+        lines.append("\n<b>Внешние сервисы</b>")
+        if os.environ.get("OPENAI_API_KEY"):
+            code = sh("curl -s -o /dev/null -w '%{http_code}' -m 10 "
+                      "-H \"Authorization: Bearer $OPENAI_API_KEY\" "
+                      "https://api.openai.com/v1/models")
+            lines.append("OpenAI (расшифровка): "
+                         + ("ключ принят" if code == "200" else f"ПРОБЛЕМА (код {code})"))
+        else:
+            lines.append("OpenAI: ключа нет — расшифровка только на gpu-hub, без резерва")
         lines.append("Telegram: отвечаю, значит доступен")
 
         # Сессия Яндекса протухает молча, и узнать об этом на встрече поздно:
@@ -1759,29 +1810,24 @@ class Bot:
             lines.append("⚠️ Яндекс: сессия умерла — иду на встречи гостем, "
                          "нужен <code>/login</code>")
 
-        # Список моделей отдаётся и при нулевом балансе, поэтому «ключ принят»
-        # ничего не говорит о деньгах. Единственный честный признак — реальный
-        # запрос: просим один токен у самой дешёвой модели. Стоит доли копейки,
-        # зато «нет средств» выясняется здесь, а не в момент, когда нужен бриф.
-        probe = sh("curl -s -m 15 https://api.openai.com/v1/chat/completions "
-                   "-H \"Authorization: Bearer $OPENAI_API_KEY\" "
-                   "-H 'Content-Type: application/json' "
-                   "-d '{\"model\":\"gpt-5-nano\",\"max_completion_tokens\":1,"
-                   "\"messages\":[{\"role\":\"user\",\"content\":\"1\"}]}'")
+        model = html.escape(os.environ.get("LLM_MODEL") or "gpt-5-mini")
+        host = html.escape(urllib.parse.urlsplit(llm_url()).netloc)
+        code, probe = llm_probe()
         if "insufficient_quota" in probe or "credit_balance_exhausted" in probe:
-            lines.append("\n❗ <b>На счёте OpenAI нет средств.</b> Записи "
-                         "сохраняются, но расшифровка и брифы не соберутся.")
-        elif "\"error\"" in probe:
+            lines.append(f"\n❗ <b>На счёте {host} нет средств.</b> Записи "
+                         "сохраняются, но брифы не соберутся.")
+        elif code != 200:
             reason = re.search(r'"message":\s*"([^"]{0,120})', probe)
-            lines.append("\n⚠️ Модель отвечает ошибкой: <code>"
+            lines.append(f"\n⚠️ Модель брифа {model} на {host} отвечает ошибкой "
+                         f"(код {code}): <code>"
                          + html.escape(reason.group(1) if reason else probe[:100])
                          + "</code>")
         else:
-            lines.append("Расшифровка: пробный запрос прошёл, средства есть")
+            lines.append(f"Бриф: {model} на {host}, пробный запрос прошёл")
 
         # Состояние машин с видеокартами спрашиваем у gpu-hub: он и есть
-        # единственный, кто их видит. Офисный ПК стоит за NAT и приходит
-        # к шлюзу сам, поэтому «жив ли он» знает только шлюз.
+        # единственный, кто их видит. Машина с картой может стоять за NAT
+        # и приходить к хабу сама, поэтому «жива ли она» знает только хаб.
         backend = os.environ.get("STT_BACKEND", "openai")
         lines.append("\n<b>Локальная расшифровка</b> (GigaAM + pyannote)")
         if backend != "local-first":

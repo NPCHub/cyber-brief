@@ -245,17 +245,28 @@ ask_token() {
   die "Три неудачные попытки ввести токен. Запустите ./install.sh ещё раз."
 }
 
-ask_openai() {
-  local key="" attempt code
+ask_openai() {  # $1 = required | optional
+  local need="$1" key="" attempt code
   key="$(get_env OPENAI_API_KEY)"
   [[ -z "$key" && -n "${OPENAI_API_KEY:-}" ]] && key="$OPENAI_API_KEY"
   if [[ -z "$key" ]]; then
-    [[ $INTERACTIVE -eq 1 ]] || die "OPENAI_API_KEY не задан, а запуск не интерактивный. Впишите ключ в $ENV_FILE и запустите снова."
-    echo "  Ключ OpenAI: https://platform.openai.com/api-keys (на счёте должны быть деньги)."
+    if [[ "$need" == optional ]]; then
+      [[ $INTERACTIVE -eq 1 ]] || { warn "OPENAI_API_KEY не задан: резервной расшифровки нет."; return 0; }
+      echo "  Ключ OpenAI нужен только как резерв: расшифровать встречу, если машина"
+      echo "  с видеокартой не ответила. Без него такая встреча будет ждать машину."
+    else
+      [[ $INTERACTIVE -eq 1 ]] || die "OPENAI_API_KEY не задан, а запуск не интерактивный. Впишите ключ в $ENV_FILE и запустите снова."
+      echo "  Ключ OpenAI: https://platform.openai.com/api-keys (на счёте должны быть деньги)."
+    fi
   fi
   for attempt in 1 2 3; do
     if [[ -z "$key" ]]; then
-      read -rsp "  Ключ OpenAI (ввод скрыт): " key; echo
+      if [[ "$need" == optional ]]; then
+        read -rsp "  Ключ OpenAI (ввод скрыт, Enter — без резерва): " key; echo
+        if [[ -z "$key" ]]; then warn "Без резерва: встречи ждут машину с видеокартой."; return 0; fi
+      else
+        read -rsp "  Ключ OpenAI (ввод скрыт): " key; echo
+      fi
     fi
     if [[ ! "$key" =~ ^[A-Za-z0-9_-]{20,}$ ]]; then
       warn "Не похоже на ключ OpenAI (ожидается sk-...)."
@@ -335,6 +346,51 @@ ask_hub() {
   set_env STT_BACKEND openai
 }
 
+# Бриф собирает языковая модель. Подходит любой сервис с OpenAI-совместимым
+# API: свой адрес, ключ и модель. По умолчанию — OpenAI.
+llm_probe() {  # $1 = адрес, $2 = ключ, $3 = модель; печатает «тело\nкод»
+  printf 'url = "%s/chat/completions"\nheader = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\ndata = "{\\"model\\":\\"%s\\",\\"max_tokens\\":1,\\"messages\\":[{\\"role\\":\\"user\\",\\"content\\":\\"1\\"}]}"\n' \
+    "$1" "$2" "$3" | curl -s -m 30 -w '\n%{http_code}' -K - 2>/dev/null || true
+}
+
+LLM_IS_OPENAI=1
+ask_llm() {
+  local url key model ans attempt resp code
+  url="$(get_env LLM_BASE_URL)"
+  if [[ -n "$url" ]]; then
+    LLM_IS_OPENAI=0
+    ok "Модель брифа: $(get_env LLM_MODEL) на $url"
+    return 0
+  fi
+  [[ $INTERACTIVE -eq 1 ]] || return 0
+  echo "  Модель для брифа: OpenAI или другой сервис с OpenAI-совместимым API"
+  echo "  (свой сервер, агрегатор, DeepSeek и т. п.)."
+  read -rp "  Использовать другой сервис? [y/N] " ans
+  if [[ ! "${ans:-N}" =~ ^[YyДд] ]]; then ok "Бриф собирает OpenAI."; return 0; fi
+  for attempt in 1 2 3; do
+    [[ -n "${url:-}" ]] || read -rp "  Адрес API (https://.../v1): " url
+    url="${url%/}"; url="${url%/chat/completions}"
+    if [[ ! "$url" =~ ^https?://[^[:space:]]+$ ]]; then warn "Ожидается адрес вида https://api.example.com/v1"; url=""; continue; fi
+    [[ -n "${key:-}" ]] || { read -rsp "  Ключ (ввод скрыт): " key; echo; }
+    [[ -n "${model:-}" ]] || read -rp "  Модель (как её называет сервис): " model
+    if [[ -z "$model" ]]; then warn "Нужно имя модели."; continue; fi
+    resp="$(llm_probe "$url" "$key" "$model")"
+    code="${resp##*$'\n'}"
+    case "$code" in
+      200)
+        set_env LLM_BASE_URL "$url"; set_env LLM_API_KEY "$key"; set_env LLM_MODEL "$model"
+        LLM_IS_OPENAI=0
+        ok "Модель брифа: $model на $url — пробный запрос прошёл."
+        return 0 ;;
+      401|403) warn "Сервис отклонил ключ ($code)."; key="" ;;
+      400|404|422) warn "Сервис не принял модель «$model» (код $code). Проверьте точное имя."; model="" ;;
+      *)
+        warn "Сервис не ответил (код '${code:-нет ответа}'). Проверьте адрес."; url="" ;;
+    esac
+  done
+  warn "Три неудачные попытки. Бриф будет собирать OpenAI."
+}
+
 ask_chats() {
   local cur ans ids
   cur="$(get_env ALLOWED_CHATS)"
@@ -403,8 +459,15 @@ ask_tz() {
 
 BOT_USERNAME=""; BOT_TOKEN=""
 ask_token
-ask_openai
 ask_hub
+ask_llm
+# OpenAI обязателен, только если без него нечем расшифровать или собрать
+# бриф. С gpu-hub и своей моделью брифа он лишь резерв расшифровки.
+if [[ "$(get_env STT_BACKEND)" == local-first && $LLM_IS_OPENAI -eq 0 ]]; then
+  ask_openai optional
+else
+  ask_openai required
+fi
 ask_chats
 ask_tz
 

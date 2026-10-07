@@ -30,6 +30,9 @@ import urllib.request
 OPENAI = "https://api.openai.com/v1"
 STT_MODEL = "gpt-4o-transcribe-diarize"
 LLM_MODEL = os.environ.get("LLM_MODEL") or "gpt-5-mini"
+# Бриф собирает любая OpenAI-совместимая модель: свой адрес, ключ и модель.
+# Пусто — OpenAI с OPENAI_API_KEY. Расшифровка от этого не зависит.
+LLM_BASE_URL = (os.environ.get("LLM_BASE_URL") or OPENAI).rstrip("/")
 # 10 минут, а не 20: зависший запрос стоит целого куска работы, и чем кусок
 # мельче, тем дешевле повтор. В 25 МБ лимита такой кусок укладывается с запасом.
 CHUNK_SECONDS = 10 * 60
@@ -191,11 +194,21 @@ def api_key() -> str:
     return key
 
 
-def post_json(path: str, payload: dict) -> dict:
+def llm_key() -> str:
+    key = os.environ.get("LLM_API_KEY")
+    if key:
+        return key
+    if LLM_BASE_URL != OPENAI:
+        sys.exit("LLM_API_KEY не задан для " + LLM_BASE_URL)
+    return api_key()
+
+
+def post_json(path: str, payload: dict, base: str = OPENAI,
+              key: str | None = None) -> dict:
     req = urllib.request.Request(
-        f"{OPENAI}{path}",
+        f"{base}{path}",
         data=json.dumps(payload).encode(),
-        headers={"Authorization": f"Bearer {api_key()}",
+        headers={"Authorization": f"Bearer {key or api_key()}",
                  "Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=600) as r:
@@ -607,18 +620,45 @@ def summarize(segments: list[dict], participants: list[str] | None = None) -> di
                 + ".\nЕсли из разговора однозначно видно, какая метка кому "
                   "соответствует, подставляй имя. Если неоднозначно — оставляй "
                   "букву, догадки недопустимы.\n\n" + body)
-    resp = post_json("/chat/completions", {
-        "model": LLM_MODEL,
-        "reasoning_effort": reasoning_effort(),
-        "messages": [
-            {"role": "system", "content": PROMPT},
-            {"role": "user", "content": body},
-        ],
-        "response_format": {"type": "json_schema", "json_schema": {
-            "name": "brief", "strict": True, "schema": BRIEF_SCHEMA}},
-    })
+    messages = [{"role": "system", "content": PROMPT},
+                {"role": "user", "content": body}]
+    payload = {"model": LLM_MODEL, "messages": messages,
+               "response_format": {"type": "json_schema", "json_schema": {
+                   "name": "brief", "strict": True, "schema": BRIEF_SCHEMA}}}
+    # reasoning_effort понимают только модели OpenAI; чужой сервер на
+    # незнакомый параметр может ответить 400.
+    if LLM_BASE_URL == OPENAI and LLM_MODEL.startswith(("gpt-", "o")):
+        payload["reasoning_effort"] = reasoning_effort()
+    try:
+        resp = post_json("/chat/completions", payload, LLM_BASE_URL, llm_key())
+    except urllib.error.HTTPError as e:
+        if e.code not in (400, 422):
+            raise
+        # Строгую JSON-схему умеют не все совместимые сервера (DeepSeek,
+        # vLLM старых версий). Тогда просим просто JSON, а схему — словами.
+        payload["response_format"] = {"type": "json_object"}
+        payload["messages"] = [
+            {"role": "system", "content": PROMPT
+             + "\n\nОтвечай только JSON-объектом по этой схеме, без пояснений:\n"
+             + json.dumps(BRIEF_SCHEMA, ensure_ascii=False)},
+            messages[1]]
+        resp = post_json("/chat/completions", payload, LLM_BASE_URL, llm_key())
     note_usage(LLM_MODEL, resp)
-    return json.loads(resp["choices"][0]["message"]["content"])
+    return parse_json_reply(resp["choices"][0]["message"]["content"])
+
+
+def parse_json_reply(text: str) -> dict:
+    """JSON из ответа модели. Не-OpenAI модели любят обернуть его в ```json
+    или предварить рассуждением в <think> — снимаем и то и другое."""
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
+    if fence:
+        text = fence.group(1).strip()
+    if not text.startswith("{"):
+        start, end = text.find("{"), text.rfind("}")
+        if start >= 0 and end > start:
+            text = text[start:end + 1]
+    return json.loads(text)
 
 
 def _norm(text: str) -> list[str]:
