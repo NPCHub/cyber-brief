@@ -276,6 +276,65 @@ ask_openai() {
   die "Три неудачные попытки ввести ключ. Запустите ./install.sh ещё раз."
 }
 
+# Машина с видеокартой — основной путь расшифровки: точнее на русском,
+# узнаёт голоса по банку образцов, бесплатна. OpenAI остаётся резервом
+# на случай, если машина не ответила.
+hub_status() {  # $1 = адрес, $2 = ключ; печатает «код тело»
+  printf 'url = "%s/v1/status"\nheader = "Authorization: Bearer %s"\n' "$1" "$2" \
+    | curl -s -m 20 -w '\n%{http_code}' -K - 2>/dev/null || true
+}
+
+ask_hub() {
+  local url key ans attempt resp code body online
+  url="$(get_env GPUHUB_URL)"; key="$(get_env GPUHUB_KEY)"
+  if [[ -z "$url" || -z "$key" ]]; then
+    [[ $INTERACTIVE -eq 1 ]] || { warn "gpu-hub не задан: расшифровка пойдёт через OpenAI."; return 0; }
+    echo "  Расшифровка на своей видеокарте через gpu-hub — основной путь, OpenAI тогда"
+    echo "  только резерв. Адрес и ключ выдаёт владелец хаба."
+    read -rp "  Подключить gpu-hub? [Y/n] " ans
+    if [[ ! "${ans:-Y}" =~ ^[YyДд] ]]; then
+      set_env STT_BACKEND openai
+      ok "Без gpu-hub: расшифровка через OpenAI. Подключить позже — ./install.sh ещё раз."
+      return 0
+    fi
+  fi
+  for attempt in 1 2 3; do
+    if [[ -z "$url" ]]; then read -rp "  Адрес хаба (https://...): " url; fi
+    url="${url%/}"
+    if [[ ! "$url" =~ ^https?://[^[:space:]]+$ ]]; then
+      warn "Ожидается адрес вида https://hub.example.com"; url=""; continue
+    fi
+    if [[ -z "$key" ]]; then read -rsp "  Ключ хаба (ввод скрыт): " key; echo; fi
+    resp="$(hub_status "$url" "$key")"
+    code="${resp##*$'\n'}"; body="${resp%$'\n'*}"
+    case "$code" in
+      200)
+        online="$(json_field "$body" "sum(1 for w in d.get('workers',[]) if w.get('online') and 'transcribe.meeting' in (w.get('skills') or []))")"
+        set_env GPUHUB_URL "$url"; set_env GPUHUB_KEY "$key"
+        set_env STT_BACKEND local-first
+        # Своя карта важнее денег за OpenAI: ждём её дольше, чем пару минут.
+        [[ -n "$(get_env LOCAL_WAIT_MIN)" && $FRESH -eq 0 ]] || set_env LOCAL_WAIT_MIN 120
+        ok "gpu-hub подключён: $url"
+        if [[ "${online:-0}" -gt 0 ]]; then
+          ok "Машин с расшифровкой на связи: $online"
+        else
+          warn "Сейчас ни одна машина с расшифровкой не на связи. Это не ошибка установки:"
+          warn "встречи будут ждать её $(get_env LOCAL_WAIT_MIN) мин, потом уйдут в OpenAI."
+        fi
+        return 0 ;;
+      401|403)
+        warn "Хаб отклонил ключ ($code). Проверьте, что ключ клиентский и не отозван."
+        key=""; [[ $INTERACTIVE -eq 1 ]] || die "gpu-hub отклонил GPUHUB_KEY из $ENV_FILE." ;;
+      *)
+        warn "Хаб не ответил по адресу $url (код '${code:-нет ответа}')."
+        url=""; key=""
+        [[ $INTERACTIVE -eq 1 ]] || die "gpu-hub недоступен по GPUHUB_URL из $ENV_FILE." ;;
+    esac
+  done
+  warn "Три неудачные попытки. Продолжаю без gpu-hub: расшифровка через OpenAI."
+  set_env STT_BACKEND openai
+}
+
 ask_chats() {
   local cur ans ids
   cur="$(get_env ALLOWED_CHATS)"
@@ -345,6 +404,7 @@ ask_tz() {
 BOT_USERNAME=""; BOT_TOKEN=""
 ask_token
 ask_openai
+ask_hub
 ask_chats
 ask_tz
 
